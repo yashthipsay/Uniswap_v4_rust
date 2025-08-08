@@ -1,17 +1,7 @@
 use alloy::{
-    providers::{ProviderBuilder},
-    primitives::{address, Address, U256, B256, Bytes, keccak256},
-    signers::{local::PrivateKeySigner, Signer},
-    contract::{ContractInstance, Interface},
-    json_abi::JsonAbi,
-    rpc::types::{TransactionRequest, Filter},
-    network::TransactionBuilder,
-    rpc::types::BlockNumberOrTag,
-    sol,
-    sol_types::{eip712_domain, SolStruct},
-
+    contract::{ContractInstance, Interface}, dyn_abi::{DynSolValue, JsonAbiExt}, json_abi::JsonAbi, primitives::{address, keccak256, Address, Bytes, TxKind, B256, U256}, providers::{ProviderBuilder, Provider}, rpc::types::{BlockNumberOrTag, TransactionRequest}, signers::{local::PrivateKeySigner, Signer}, sol, sol_types::{eip712_domain, SolStruct, SolValue}
 };
-use alloy_primitives::aliases::{U160, U48};
+use alloy_primitives::aliases::{U160, U48, U24};
 use alloy_signer::Signature;
 use eyre::Result;
 use std::env;
@@ -34,6 +24,8 @@ const PERMIT2_ABI: &str = r#"
 [{"inputs":[{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"AllowanceExpired","type":"error"},{"inputs":[],"name":"ExcessiveInvalidation","type":"error"},{"inputs":[{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"InsufficientAllowance","type":"error"},{"inputs":[{"internalType":"uint256","name":"maxAmount","type":"uint256"}],"name":"InvalidAmount","type":"error"},{"inputs":[],"name":"InvalidContractSignature","type":"error"},{"inputs":[],"name":"InvalidNonce","type":"error"},{"inputs":[],"name":"InvalidSignature","type":"error"},{"inputs":[],"name":"InvalidSignatureLength","type":"error"},{"inputs":[],"name":"InvalidSigner","type":"error"},{"inputs":[],"name":"LengthMismatch","type":"error"},{"inputs":[{"internalType":"uint256","name":"signatureDeadline","type":"uint256"}],"name":"SignatureExpired","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"spender","type":"address"},{"indexed":false,"internalType":"uint160","name":"amount","type":"uint160"},{"indexed":false,"internalType":"uint48","name":"expiration","type":"uint48"}],"name":"Approval","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":false,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"address","name":"spender","type":"address"}],"name":"Lockdown","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"spender","type":"address"},{"indexed":false,"internalType":"uint48","name":"newNonce","type":"uint48"},{"indexed":false,"internalType":"uint48","name":"oldNonce","type":"uint48"}],"name":"NonceInvalidation","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"spender","type":"address"},{"indexed":false,"internalType":"uint160","name":"amount","type":"uint160"},{"indexed":false,"internalType":"uint48","name":"expiration","type":"uint48"},{"indexed":false,"internalType":"uint48","name":"nonce","type":"uint48"}],"name":"Permit","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":false,"internalType":"uint256","name":"word","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"mask","type":"uint256"}],"name":"UnorderedNonceInvalidation","type":"event"},{"inputs":[],"name":"DOMAIN_SEPARATOR","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint160","name":"amount","type":"uint160"},{"internalType":"uint48","name":"expiration","type":"uint48"},{"internalType":"uint48","name":"nonce","type":"uint48"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint160","name":"amount","type":"uint160"},{"internalType":"uint48","name":"expiration","type":"uint48"}],"name":"approve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint48","name":"newNonce","type":"uint48"}],"name":"invalidateNonces","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"wordPos","type":"uint256"},{"internalType":"uint256","name":"mask","type":"uint256"}],"name":"invalidateUnorderedNonces","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"internalType":"struct IAllowanceTransfer.TokenSpenderPair[]","name":"approvals","type":"tuple[]"}],"name":"lockdown","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"uint256","name":"","type":"uint256"}],"name":"nonceBitmap","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"owner","type":"address"},{"components":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint160","name":"amount","type":"uint160"},{"internalType":"uint48","name":"expiration","type":"uint48"},{"internalType":"uint48","name":"nonce","type":"uint48"}],"internalType":"struct IAllowanceTransfer.PermitDetails[]","name":"details","type":"tuple[]"},{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"sigDeadline","type":"uint256"}],"internalType":"struct IAllowanceTransfer.PermitBatch","name":"permitBatch","type":"tuple"},{"internalType":"bytes","name":"signature","type":"bytes"}],"name":"permit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"owner","type":"address"},{"components":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint160","name":"amount","type":"uint160"},{"internalType":"uint48","name":"expiration","type":"uint48"},{"internalType":"uint48","name":"nonce","type":"uint48"}],"internalType":"struct IAllowanceTransfer.PermitDetails","name":"details","type":"tuple"},{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"sigDeadline","type":"uint256"}],"internalType":"struct IAllowanceTransfer.PermitSingle","name":"permitSingle","type":"tuple"},{"internalType":"bytes","name":"signature","type":"bytes"}],"name":"permit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"internalType":"struct ISignatureTransfer.TokenPermissions","name":"permitted","type":"tuple"},{"internalType":"uint256","name":"nonce","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct ISignatureTransfer.PermitTransferFrom","name":"permit","type":"tuple"},{"components":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"requestedAmount","type":"uint256"}],"internalType":"struct ISignatureTransfer.SignatureTransferDetails","name":"transferDetails","type":"tuple"},{"internalType":"address","name":"owner","type":"address"},{"internalType":"bytes","name":"signature","type":"bytes"}],"name":"permitTransferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"internalType":"struct ISignatureTransfer.TokenPermissions[]","name":"permitted","type":"tuple[]"},{"internalType":"uint256","name":"nonce","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct ISignatureTransfer.PermitBatchTransferFrom","name":"permit","type":"tuple"},{"components":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"requestedAmount","type":"uint256"}],"internalType":"struct ISignatureTransfer.SignatureTransferDetails[]","name":"transferDetails","type":"tuple[]"},{"internalType":"address","name":"owner","type":"address"},{"internalType":"bytes","name":"signature","type":"bytes"}],"name":"permitTransferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"internalType":"struct ISignatureTransfer.TokenPermissions","name":"permitted","type":"tuple"},{"internalType":"uint256","name":"nonce","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct ISignatureTransfer.PermitTransferFrom","name":"permit","type":"tuple"},{"components":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"requestedAmount","type":"uint256"}],"internalType":"struct ISignatureTransfer.SignatureTransferDetails","name":"transferDetails","type":"tuple"},{"internalType":"address","name":"owner","type":"address"},{"internalType":"bytes32","name":"witness","type":"bytes32"},{"internalType":"string","name":"witnessTypeString","type":"string"},{"internalType":"bytes","name":"signature","type":"bytes"}],"name":"permitWitnessTransferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"internalType":"struct ISignatureTransfer.TokenPermissions[]","name":"permitted","type":"tuple[]"},{"internalType":"uint256","name":"nonce","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct ISignatureTransfer.PermitBatchTransferFrom","name":"permit","type":"tuple"},{"components":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"requestedAmount","type":"uint256"}],"internalType":"struct ISignatureTransfer.SignatureTransferDetails[]","name":"transferDetails","type":"tuple[]"},{"internalType":"address","name":"owner","type":"address"},{"internalType":"bytes32","name":"witness","type":"bytes32"},{"internalType":"string","name":"witnessTypeString","type":"string"},{"internalType":"bytes","name":"signature","type":"bytes"}],"name":"permitWitnessTransferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint160","name":"amount","type":"uint160"},{"internalType":"address","name":"token","type":"address"}],"internalType":"struct IAllowanceTransfer.AllowanceTransferDetails[]","name":"transferDetails","type":"tuple[]"}],"name":"transferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint160","name":"amount","type":"uint160"},{"internalType":"address","name":"token","type":"address"}],"name":"transferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"}]
 "#;
 
+
+
 sol! {
     #[derive(Debug)]
     struct PermitDetails {
@@ -50,6 +42,7 @@ sol! {
         uint256 sigDeadline;
     }
 }
+
 
 
 // ERC20 ABI for token interactions
@@ -107,11 +100,40 @@ pub fn create_permit2_signable_message(
         sigDeadline: sig_deadline,
     };
 
+
         // Hash for signing
     let hash = permit_single.eip712_signing_hash(&domain);
 
     Ok((permit_single, hash))
 }
+
+
+sol! {
+    #[derive(Debug)]
+    struct SettleAllParams {
+        address token;
+        uint256 amount;
+    }
+
+    #[derive(Debug)]
+    struct TakeAllParams {
+        address token;
+        uint256 minAmount;
+    }
+}
+
+sol! {
+    #[derive(Debug)]
+    struct ExactInSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMin;
+    }
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()>{
@@ -127,8 +149,7 @@ async fn main() -> Result<()>{
     let signer = PrivateKeySigner::from_slice(&hex::decode(private_key.strip_prefix("0x").unwrap_or(&private_key))?)?;
 
     let provider = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .wallet(signer.clone())
+        .wallet(signer.clone()) // no disable_recommended_fillers()
         .connect(&ws_url)
         .await?;
 
@@ -158,13 +179,142 @@ async fn main() -> Result<()>{
         0,
         UNIVERSAL_ROUTER_V4,
         U256::from(1_726_000_000u64),
-        1,
+        11155111,
         PERMIT2_CONTRACT,
     )?;
 
     let signature = signer.sign_hash(&hash).await?;
     println!("PermitSingle: {permit:?}");
     println!("Signature created");
+    
+    // Create the LINK token contract instance
+    let usdc_token = IERC20::new(USDC, provider.clone());
+
+    // Call approve() to give Permit2 unlimited allowance
+    let approve_receipt = usdc_token
+        .approve(PERMIT2_CONTRACT, U256::MAX)
+        .send()
+        .await?
+        .watch()
+        .await?;
+    println!("Permit2 approved for USDC in tx: {approve_receipt:?}");
+
+    // === 2) Permit2 internal approve USDC -> Router ===
+    let current_block = provider.get_block(alloy::eips::BlockId::Number(BlockNumberOrTag::Latest)).await?
+    .ok_or_else(|| eyre::eyre!("No latest block"))?;
+    let current_ts: u64 = current_block.header.timestamp;
+    let deadline = U256::from(current_ts + 300); // 5 minutes from now
+    let amount_to_move = U256::from(10_000_000u64); // e.g. 10 USDC if 6 decimals
+    let expiration_ts = U256::from(deadline); // adjust as needed
+
+    let permit2_approve_fn = permit2
+        .abi()
+        .functions()
+        .find(|f| f.name == "approve" && f.inputs.len() == 4)
+        .expect("permit2.approve fn not found");
+
+    let permit2_approve_calldata = permit2_approve_fn.abi_encode_input(&[
+        DynSolValue::Address(USDC),
+        DynSolValue::Address(UNIVERSAL_ROUTER_V4),
+        DynSolValue::Uint(amount_to_move, 160), // uint160
+        DynSolValue::Uint(expiration_ts, 48),   // uint48
+    ])?;
+
+    let p2_tx = TransactionRequest {
+        to: Some(TxKind::Call(PERMIT2_CONTRACT)),
+        input: permit2_approve_calldata.into(),
+        ..Default::default()
+    };
+
+    let p2_pending = provider.send_transaction(p2_tx).await?;
+    let p2_receipt = p2_pending.watch().await?;
+    println!("Permit2 internal approve mined: {:?}", p2_receipt);
+
+    // Commands: PERMIT2_TRANSFER_FROM (0x02), then V4_SWAP (0x16)
+    let commands = DynSolValue::Bytes(vec![0x02, 0x10]);
+
+    // --- Build the PERMIT2_TRANSFER_FROM input (token, recipient(router), amount) ---
+    // amount you want to move from owner -> router
+    let amount_to_move = U256::from(10_000_000u64);
+    let encoded_p2_transfer = DynSolValue::Tuple(vec![
+        DynSolValue::Address(USDC),
+        DynSolValue::Address(UNIVERSAL_ROUTER_V4),
+        // Permit2 uses uint160 for amounts — encode with bitwidth 160
+        DynSolValue::Uint(amount_to_move, 160),
+    ]).abi_encode();
+
+    // --- Build V4 swap inner actions (packed as one input) ---
+    // Build the inner action bytes sequence (V4 action opcodes)
+    let v4_actions_bytes: Bytes = vec![0x06u8, 0x0cu8, 0x0fu8].into(); // SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL
+
+    // individual encoded action arguments (these are the same as you already had)
+    let encoded_swap = ExactInSingleParams {
+        tokenIn: USDC,
+        tokenOut: LINK,
+        fee: U24::from(3000u32),
+        recipient: signer.address(),
+        amountIn: amount_to_move,
+        amountOutMin: U256::from(0),
+    }.abi_encode();
+
+    let encoded_settle = SettleAllParams {
+        token: USDC,
+        amount: amount_to_move,
+    }.abi_encode();
+
+    let encoded_take = TakeAllParams {
+        token: LINK,
+        minAmount: U256::from(0),
+    }.abi_encode();
+
+    // Pack them into V4_SWAP input: (bytes actions, bytes[] arguments)
+    let v4_arguments = DynSolValue::Array(vec![
+        DynSolValue::Bytes(encoded_swap),
+        DynSolValue::Bytes(encoded_settle),
+        DynSolValue::Bytes(encoded_take),
+    ]);
+
+    let encoded_v4_swap_input = DynSolValue::Tuple(vec![
+        DynSolValue::Bytes(v4_actions_bytes.to_vec()),
+        v4_arguments,
+    ]).abi_encode();
+
+    // inputs vector: first input matches 0x02 (PERMIT2_TRANSFER_FROM), second matches 0x16 (V4_SWAP)
+    let inputs_vec: Vec<DynSolValue> = vec![
+        DynSolValue::Bytes(encoded_p2_transfer),
+        DynSolValue::Bytes(encoded_v4_swap_input),
+    ];
+
+    // Find execute overload with 3 params and encode calldata (with deadline)
+    let function = universal_router
+        .abi()
+        .functions()
+        .find(|f| f.name == "execute" && f.inputs.len() == 3)
+        .expect("Function not found");
+
+    let current_block = provider.get_block(alloy::eips::BlockId::Number(BlockNumberOrTag::Latest)).await?
+    .ok_or_else(|| eyre::eyre!("No latest block"))?;
+    let current_ts: u64 = current_block.header.timestamp;
+    let deadline = U256::from(current_ts + 300); // 5 minutes from now
+
+    let calldata = function.abi_encode_input(&[
+        commands,
+        DynSolValue::Array(inputs_vec),
+        DynSolValue::Uint(deadline, 256),
+    ])?;
+
+    let tx = TransactionRequest {
+        to: Some(TxKind::Call(UNIVERSAL_ROUTER_V4)),
+        input: calldata.into(),
+        ..Default::default()
+    };
+
+    // Optional: simulate the call first
+    let simulation = provider
+        .call(tx.clone())
+        .block(alloy::eips::BlockId::Number(BlockNumberOrTag::Latest))
+        .await?;
+    println!("Simulation result: {simulation:#x?}");
 
     Ok(())
 }

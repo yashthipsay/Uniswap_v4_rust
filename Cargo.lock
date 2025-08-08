@@ -3619,7 +3619,9 @@ name = "uniswap_rust"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-provider",
  "alloy-signer",
  "alloy-sol-types",
  "dotenv",
