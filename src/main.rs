@@ -9,16 +9,17 @@ use alloy::{
     sol, transports::http::Http,
     sol_types::{eip712_domain, SolStruct, SolValue}
 };
-use alloy_primitives::aliases::U48;
 use alloy::transports::RpcError;
+use alloy_primitives::{aliases::U48, keccak256};
 use eyre::Result;
 use std::{env, time::{SystemTime, UNIX_EPOCH}};
 
 // Contract addresses
 const UNIVERSAL_ROUTER_V4: Address = address!("0x3A9D48AB9751398BbFa63ad67599Bb04e4BdF98b");
 const PERMIT2_CONTRACT: Address = address!("0x000000000022D473030F116dDEE9F6B43aC78BA3");
+const STATE_VIEW: Address = address!("0xE1Dd9c3fA50EDB962E442f60DfBc432e24537E4C");
 
-// Token addresses (example tokens on Sepolia)
+// Token addresses
 const USDC: Address = address!("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238");
 const LINK: Address = address!("0x779877a7b0d9e8603169ddbd7836e478b4624789");
 
@@ -78,10 +79,18 @@ sol! {
     }
 }
 
-// Create and sign a Permit2 message
+sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract StateView {
+        function getLiquidity(bytes32 poolId) external view returns (uint128 liquidity);
+    }
+}
+
+// Create and sign a Permit2 message (updated to use max amount)
 pub fn create_permit2_signable_message(
     token: Address,
-    amount: U256,
+    amount: U256, // Max amount (2^160 - 1)
     expiration: u64,
     nonce: u64,
     spender: Address,
@@ -89,16 +98,18 @@ pub fn create_permit2_signable_message(
     chain_id: u64,
     verifying_contract: Address,
 ) -> Result<(PermitSingle, B256)> {
-
     let domain = eip712_domain! {
         name: "Permit2",
         chain_id: chain_id,
         verifying_contract: verifying_contract,
     };
 
+    // Correct U160 from U256 limbs (low 3 limbs for 160 bits)
+    let amount_u160 = U160::from_limbs(amount.as_limbs()[0..3].try_into()?);
+
     let details = PermitDetails {
         token,
-        amount: U160::from(amount.to::<u64>()),
+        amount: amount_u160,
         expiration: U48::from(expiration),
         nonce: U48::from(nonce),
     };
@@ -113,6 +124,7 @@ pub fn create_permit2_signable_message(
     Ok((permit_single, hash))
 }
 
+// Decode revert reason
 fn decode_revert_reason(data: &[u8]) -> Option<String> {
     if data.len() >= 4 && &data[0..4] == [0x08, 0xc3, 0x79, 0xa0] {
         if data.len() >= 4 + 32 + 32 {
@@ -127,14 +139,69 @@ fn decode_revert_reason(data: &[u8]) -> Option<String> {
     None
 }
 
+// Enhanced simulation with custom error decoding
+async fn simulate_with_revert_decoding<P: Provider>(provider: &P, tx: TransactionRequest) -> Result<Bytes> {
+    match provider.call(tx.clone()).block(BlockNumberOrTag::Latest.into()).await {
+        Ok(data) => Ok(data),
+        Err(RpcError::ErrorResp(err)) => {
+            if let Some(data) = &err.data {
+                if let Ok(hex_data) = serde_json::from_str::<String>(data.get()) {
+                    let revert_bytes = hex::decode(hex_data.strip_prefix("0x").unwrap_or(&hex_data))?;
+                    if let Some(reason) = decode_revert_reason(&revert_bytes) {
+                        return Err(eyre::eyre!("Revert reason: {}", reason));
+                    } else if revert_bytes.len() >= 4 {
+                        let selector = hex::encode(&revert_bytes[0..4]);
+                        // Expanded error map (PoolManager and Permit2)
+                        let error_map = [
+                            ("0x9860a0a9", "PoolNotInitialized"),
+                            ("0x7c0b7d22", "V4TooLittleReceived"),
+                            ("0x9d5e7b97", "V4TooMuchRequested"),
+                            ("0x4a4f6a7d", "PoolLocked"),
+                            ("0x1b9263bb", "InvalidDelta"),
+                            ("0x5d1d0f9f", "InputLengthMismatch"),
+                            ("0x8baa579f", "InvalidSignature"), // Permit2
+                            ("0x5b0d3c3d", "InvalidNonce"), // Permit2
+                            ("0x3a0a5c7b", "ExpiredPermit"), // Permit2
+                            ("0x5c5a9f0e", "InvalidSigner"), // Permit2
+                            ("0x0c49ccbe", "ExcessiveInvalidation"), // Permit2
+                        ];
+                        for (sel, name) in error_map.iter() {
+                            if selector == *sel {
+                                return Err(eyre::eyre!("Custom error: {}", name));
+                            }
+                        }
+                        return Err(eyre::eyre!("Unknown custom error selector: 0x{}, raw data: 0x{}", selector, hex::encode(&revert_bytes)));
+                    }
+                }
+            }
+            Err(eyre::eyre!("Simulation reverted without decodable reason, raw error: {:?}", err))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+// Check pool liquidity
+async fn check_pool_liquidity<P: Provider>(provider: &P, token0: Address, token1: Address, fee: u32, tick_spacing: i32, hooks: Address) -> Result<u128> {
+    let state_view = StateView::new(STATE_VIEW, provider.clone());
+    let pool_key = DynSolValue::Tuple(vec![
+        DynSolValue::Address(token0),
+        DynSolValue::Address(token1),
+        DynSolValue::Uint(U256::from(fee), 24),
+        DynSolValue::Int(alloy::primitives::I256::try_from(tick_spacing as i64).expect("tick_spacing fits in i64"), 24),
+        DynSolValue::Address(hooks),
+    ]);
+    let pool_id = keccak256(pool_key.abi_encode());
+    let liquidity = state_view.getLiquidity(pool_id).call().await?;
+    Ok(liquidity)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
     dotenv::dotenv().ok();
-    
-    let rpc_url = env::var("ETH_RPC_URL").unwrap_or_else(|_| "https://sepolia.infura.io/v3/YOUR_KEY".to_string());
+    let rpc_url = env::var("ETH_RPC_URL").unwrap_or_else(|_| "https://rpc.ankr.com/eth_sepolia/e2a1f8575bdf5101891a705f337daa3557709da7ff9d00237390d9e49b18d346".to_string());
     let private_key = env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
-    
+
     // Setup provider and signer
     let signer = PrivateKeySigner::from_slice(
         &hex::decode(private_key.strip_prefix("0x").unwrap_or(&private_key))?
@@ -142,21 +209,29 @@ async fn main() -> Result<()> {
     let provider = ProviderBuilder::new()
         .wallet(signer.clone())
         .on_http(rpc_url.parse()?);
-        
+
     // Define swap parameters
-    let amount_to_move = U256::from(1_000_000u128); // 0.0001 tokens with 18 decimals
+    let amount_to_move = U256::from(1_000_000u128); // 1 USDC (6 decimals)
+    let max_permit_amount = U256::MAX >> (256 - 160); // 2^160 - 1
     let current_ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let deadline = U256::from(current_ts + 3000); // 50 minutes
-    
-    // Pool parameters
-    let fee_u32 = 3000u32; // 0.3%
-    let tick_spacing_i32 = 60;
+    let fee = 3000u32; // 0.3%
+    let tick_spacing = 60i32;
     let hooks = Address::ZERO;
-    
-    // Create pool key ensuring correct ordering
+
+    // Pool parameters
     let zero_for_one = USDC < LINK;
     let (currency0, currency1) = if zero_for_one { (USDC, LINK) } else { (LINK, USDC) };
 
+    // Check pool liquidity
+    println!("Checking pool liquidity...");
+    let liquidity = check_pool_liquidity(&provider, currency0, currency1, fee, tick_spacing, hooks).await?;
+    println!("Pool liquidity: {}", liquidity);
+    if liquidity == 0 {
+        println!("WARNING: Pool has zero liquidity. Swap will likely fail. Consider minting a position.");
+    }
+
+    // Approve Permit2 for USDC
     let usdc_token = IERC20::new(USDC, provider.clone());
     let approve_receipt = usdc_token
         .approve(PERMIT2_CONTRACT, U256::MAX)
@@ -164,37 +239,39 @@ async fn main() -> Result<()> {
         .await?
         .watch()
         .await?;
-    println!("Permit2 approved for USDC in tx: {approve_receipt:?}");
-    
-    // --- STEP 1: Create and sign the Permit2 message ---
+    println!("Permit2 approved for USDC in tx: {:?}", approve_receipt);
+
+    // Fetch Permit2 nonce
+    let permit2 = Permit2::new(PERMIT2_CONTRACT, provider.clone());
+    let allowance_call = permit2.allowance(signer.address(), USDC, UNIVERSAL_ROUTER_V4);
+    let Permit2::allowanceReturn { amount, expiration, nonce } = allowance_call.call().await?;
+    println!("Fetched Permit2 allowance: amount={}, expiration={}, nonce={}", amount, expiration, nonce);
+
+    // Create and sign Permit2 message
     let (permit_single, hash) = create_permit2_signable_message(
         USDC,
-        amount_to_move,
-        current_ts + 3600,     // expiration (1 hour from now)
-        0,                     // nonce
-        UNIVERSAL_ROUTER_V4,   // spender
-        deadline,              // signature deadline
-        11155111,              // Sepolia chain ID
+        max_permit_amount,
+        current_ts + 30 * 24 * 3600, // 30 days expiration
+        nonce.to::<u64>(),
+        UNIVERSAL_ROUTER_V4,
+        deadline,
+        11155111, // Sepolia chain ID
         PERMIT2_CONTRACT,
     )?;
-
+    println!("Permit hash: 0x{}", hex::encode(hash));
     let signature = signer.sign_hash(&hash).await?;
-    let signature_bytes = Bytes::copy_from_slice(&signature.as_bytes().to_vec());
-    println!("PermitSingle signed. Signature: {signature_bytes:?}");
-    
-    // --- STEP 2: Build the transaction commands and inputs ---
-    
-    // Command byte sequence: [PERMIT2_PERMIT (0x0a), V4_SWAP (0x10)]
+    let signature_bytes = Bytes::from(signature.as_bytes().to_vec());
+    println!("PermitSingle signed. Signature: {:?}", signature_bytes);
+
+    // Build transaction commands: [PERMIT2_PERMIT (0x0a), V4_SWAP (0x10)]
     let commands: Bytes = vec![0x0a, 0x10].into();
-    
-    // --- STEP 3: Build the PERMIT2_PERMIT input ---
-    
-    // PERMIT2_PERMIT params: (PermitSingle permit, bytes signature)
+
+    // PERMIT2_PERMIT input
     let permit_input = DynSolValue::Tuple(vec![
         DynSolValue::Tuple(vec![
             DynSolValue::Tuple(vec![
                 DynSolValue::Address(permit_single.details.token),
-                DynSolValue::Uint(U256::from(permit_single.details.amount.to::<u64>()), 160),
+                DynSolValue::Uint(U256::from(permit_single.details.amount), 160), // Correct U160 to U256 conversion
                 DynSolValue::Uint(U256::from(permit_single.details.expiration.to::<u64>()), 48),
                 DynSolValue::Uint(U256::from(permit_single.details.nonce.to::<u64>()), 48),
             ]),
@@ -203,123 +280,94 @@ async fn main() -> Result<()> {
         ]),
         DynSolValue::Bytes(signature_bytes.to_vec()),
     ]).abi_encode();
-    
-    // --- STEP 4: Build the V4_SWAP input ---
-    
-    // V4 action bytes for: [SWAP_EXACT_IN_SINGLE (0x06), SETTLE_ALL (0x0c), TAKE_ALL (0x0f)]
-    let v4_actions_bytes: Bytes = vec![0x06u8, 0x0cu8, 0x0fu8].into();
-    
-    // 4.1 SWAP_EXACT_IN_SINGLE params
+
+    // V4_SWAP input: [SWAP_EXACT_IN_SINGLE (0x06), TAKE_ALL (0x0f), SETTLE_ALL (0x0c)]
+    let v4_actions_bytes: Bytes = vec![0x06, 0x0f, 0x0c].into();
+
+    // SWAP_EXACT_IN_SINGLE params
     let pool_key_tuple = DynSolValue::Tuple(vec![
         DynSolValue::Address(currency0),
         DynSolValue::Address(currency1),
-        DynSolValue::Uint(U256::from(fee_u32), 24),
-        DynSolValue::Int(alloy::primitives::I256::try_from(tick_spacing_i32 as i64).expect("tick_spacing_i32 fits in i64"), 24),
+        DynSolValue::Uint(U256::from(fee), 24),
+        DynSolValue::Int(alloy::primitives::I256::try_from(tick_spacing as i64).expect("tick_spacing fits in i64"), 24),
         DynSolValue::Address(hooks),
     ]);
-    
+    let amount_out_min = amount_to_move * U256::from(99u8) / U256::from(100u8); // 1% slippage tolerance
     let exact_in_tuple = DynSolValue::Tuple(vec![
         pool_key_tuple,
         DynSolValue::Bool(zero_for_one),
         DynSolValue::Uint(amount_to_move, 128),
-        DynSolValue::Uint(U256::from(0), 128), // amount_out_min (no slippage for demo)
-        DynSolValue::Bytes(vec![]), // hook_data (empty)
+        DynSolValue::Uint(amount_out_min, 128),
+        DynSolValue::Bytes(vec![]), // hook_data
     ]);
-    
-    // 4.2 SETTLE_ALL params
-    let settle_tuple = DynSolValue::Tuple(vec![
-        DynSolValue::Address(USDC),
-        DynSolValue::Uint(amount_to_move, 256),
-    ]);
-    let encoded_settle = settle_tuple.abi_encode();
-    
-    // 4.3 TAKE_ALL params
+
+    // TAKE_ALL params (output: LINK)
     let take_tuple = DynSolValue::Tuple(vec![
         DynSolValue::Address(LINK),
         DynSolValue::Uint(U256::ZERO, 256),
     ]);
     let encoded_take = take_tuple.abi_encode();
-    
-    // 4.4 Combine all V4 action arguments
+
+    // SETTLE_ALL params (input: USDC)
+    let settle_tuple = DynSolValue::Tuple(vec![
+        DynSolValue::Address(USDC),
+        DynSolValue::Uint(amount_to_move, 256),
+    ]);
+    let encoded_settle = settle_tuple.abi_encode();
+
+    // Combine V4 action arguments
     let v4_arguments = DynSolValue::Array(vec![
         DynSolValue::Bytes(exact_in_tuple.abi_encode()),
-        DynSolValue::Bytes(encoded_settle),
         DynSolValue::Bytes(encoded_take),
+        DynSolValue::Bytes(encoded_settle),
     ]);
-    
-    // 4.5 Encode V4_SWAP input
     let encoded_v4_swap_input = DynSolValue::Tuple(vec![
         DynSolValue::Bytes(v4_actions_bytes.to_vec()),
         v4_arguments,
     ]).abi_encode();
-    
-    // --- STEP 5: Combine all inputs for Universal Router execute ---
-    
+
+    // Combine inputs
     let inputs_vec = vec![
         DynSolValue::Bytes(permit_input),
         DynSolValue::Bytes(encoded_v4_swap_input),
     ];
-    
-    // --- STEP 6: Create the transaction ---
-    
-    // Build calldata for execute(bytes commands, bytes[] inputs, uint256 deadline)
-    use alloy::primitives::keccak256;
-    
+
+    // Build calldata for execute(bytes,bytes[],uint256)
     let function_selector = &keccak256("execute(bytes,bytes[],uint256)".as_bytes())[0..4];
     let encoded_params = DynSolValue::Tuple(vec![
         DynSolValue::Bytes(commands.to_vec()),
         DynSolValue::Array(inputs_vec),
         DynSolValue::Uint(deadline, 256),
     ]).abi_encode();
-    
-    let mut calldata = Vec::new();
-    calldata.extend_from_slice(function_selector);
-    calldata.extend_from_slice(&encoded_params);
-    
-    // Create transaction request
+    let mut calldata = function_selector.to_vec();
+    calldata.extend(encoded_params);
+    println!("Calldata: 0x{}", hex::encode(&calldata));
+
+    // Create transaction
     let tx = TransactionRequest {
         to: Some(TxKind::Call(UNIVERSAL_ROUTER_V4)),
         input: calldata.into(),
         from: Some(signer.address()),
+        gas: Some(500_000u64),
         ..Default::default()
     };
-    
-    // --- STEP 7: Simulate and send the transaction ---
-    
-    // Simulate first
+
+    // Simulate transaction
     println!("Simulating transaction...");
-    let simulation = provider
-        .call(tx.clone())
-        .block(BlockNumberOrTag::Latest.into())
-        .await;
-        
-    match simulation {
-        Ok(data) => {
-            println!("Simulation successful! Return data: 0x{}", hex::encode(data));
-        }
-        Err(rpc_err) => {
-            println!("Simulation failed: {rpc_err}");
-            println!("Proceeding with transaction anyway...");
-        }
+    match simulate_with_revert_decoding(&provider, tx.clone()).await {
+        Ok(data) => println!("Simulation successful! Return data: 0x{}", hex::encode(data)),
+        Err(e) => println!("Simulation failed: {}", e),
     }
 
-    // Send the transaction
+    // Send transaction
     println!("Sending transaction with Permit2 Permit and V4 Swap...");
-    let tx = TransactionRequest {
-        gas: Some(500_000u64),
-        from: Some(signer.address()),
-        ..tx
-    };
-    
     match provider.send_transaction(tx).await {
         Ok(pending_tx) => {
             let tx_hash = pending_tx.tx_hash();
-            println!("Transaction sent! Hash: {tx_hash}");
-            
+            println!("Transaction sent! Hash: {}", tx_hash);
             match pending_tx.watch().await {
                 Ok(receipt_hash) => {
-                    println!("Transaction confirmed with hash: {receipt_hash:?}");
-                    
+                    println!("Transaction confirmed with hash: {:?}", receipt_hash);
                     match provider.get_transaction_receipt(receipt_hash).await {
                         Ok(Some(receipt)) => {
                             if receipt.status() {
@@ -329,14 +377,14 @@ async fn main() -> Result<()> {
                             }
                         }
                         Ok(None) => println!("Receipt not found"),
-                        Err(e) => println!("Error getting receipt: {e}"),
+                        Err(e) => println!("Error getting receipt: {}", e),
                     }
-                },
-                Err(e) => println!("Error waiting for transaction: {e}"),
+                }
+                Err(e) => println!("Error waiting for transaction: {}", e),
             }
-        },
-        Err(e) => println!("Error sending transaction: {e}"),
+        }
+        Err(e) => println!("Error sending transaction: {}", e),
     }
-    
+
     Ok(())
 }
