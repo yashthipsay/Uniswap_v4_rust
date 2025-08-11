@@ -171,14 +171,14 @@ async fn main() -> Result<()> {
     println!("Universal Router contract initialized at: {UNIVERSAL_ROUTER_V4}");
 
     // --- Manual Approve USDC for Permit2 ---
-    // let usdc_token = IERC20::new(USDC, provider.clone());
-    // let approve_receipt = usdc_token
-    //     .approve(PERMIT2_CONTRACT, U256::MAX)
-    //     .send()
-    //     .await?
-    //     .watch()
-    //     .await?;
-    // println!("Permit2 approved for USDC in tx: {approve_receipt:?}");
+    let usdc_token = IERC20::new(USDC, provider.clone());
+    let approve_receipt = usdc_token
+        .approve(PERMIT2_CONTRACT, U256::MAX)
+        .send()
+        .await?
+        .watch()
+        .await?;
+    println!("Permit2 approved for USDC in tx: {approve_receipt:?}");
 
     // --- Create and sign the PermitSingle message ---
     let owner_address = signer.address();
