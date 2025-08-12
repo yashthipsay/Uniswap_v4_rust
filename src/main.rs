@@ -10,7 +10,8 @@ use alloy::{
     sol_types::{eip712_domain, SolStruct, SolValue}
 };
 use alloy::transports::RpcError;
-use alloy_primitives::{aliases::U48, keccak256};
+use alloy_primitives::{aliases::U48, keccak256, I256};
+use alloy_primitives::aliases::{U24, I24};
 use eyre::Result;
 use std::{env, time::{SystemTime, UNIX_EPOCH}};
 
@@ -105,7 +106,11 @@ pub fn create_permit2_signable_message(
     };
 
     // Correct U160 from U256 limbs (low 3 limbs for 160 bits)
-    let amount_u160 = U160::from_limbs(amount.as_limbs()[0..3].try_into()?);
+    let amount_u160: U160 = if amount > U256::from(U160::MAX) {
+        return Err(eyre::eyre!("Amount exceeds U160::MAX"));
+    } else {
+        amount.to::<U160>()
+    };
 
     let details = PermitDetails {
         token,
@@ -183,14 +188,14 @@ async fn simulate_with_revert_decoding<P: Provider>(provider: &P, tx: Transactio
 // Check pool liquidity
 async fn check_pool_liquidity<P: Provider>(provider: &P, token0: Address, token1: Address, fee: u32, tick_spacing: i32, hooks: Address) -> Result<u128> {
     let state_view = StateView::new(STATE_VIEW, provider.clone());
-    let pool_key = DynSolValue::Tuple(vec![
+    let pool_key_tuple = DynSolValue::Tuple(vec![
         DynSolValue::Address(token0),
         DynSolValue::Address(token1),
-        DynSolValue::Uint(U256::from(fee), 24),
-        DynSolValue::Int(alloy::primitives::I256::try_from(tick_spacing as i64).expect("tick_spacing fits in i64"), 24),
+        DynSolValue::Uint(U256::from(U24::try_from(fee)?), 24),
+        DynSolValue::Int(I256::from(I24::try_from(tick_spacing)?), 24),
         DynSolValue::Address(hooks),
     ]);
-    let pool_id = keccak256(pool_key.abi_encode());
+    let pool_id = keccak256(pool_key_tuple.abi_encode());
     let liquidity = state_view.getLiquidity(pool_id).call().await?;
     Ok(liquidity)
 }
@@ -260,6 +265,26 @@ async fn main() -> Result<()> {
     )?;
     println!("Permit hash: 0x{}", hex::encode(hash));
     let signature = signer.sign_hash(&hash).await?;
+
+    // normalize r||s||v so v ∈ {27,28}
+
+    // let mut sig_bytes = signature.as_bytes().to_vec();
+    // if sig_bytes.len() == 65 {
+    //     let v = sig_bytes[64];
+    //     if v == 0 || v == 1 {
+    //         sig_bytes[64] = v + 27;
+    //     }
+    // } else if sig_bytes.len() == 64 {
+    //     return Err(eyre::eyre!(
+    //         "signature is 64 bytes (compact) — need full r||s||v"
+    //     ));
+    // } else {
+    //     return Err(eyre::eyre!(
+    //         "unexpected signature length: {}",
+    //         sig_bytes.len()
+    //     ));
+    // }
+
     let signature_bytes = Bytes::from(signature.as_bytes().to_vec());
     println!("PermitSingle signed. Signature: {:?}", signature_bytes);
 
@@ -268,21 +293,12 @@ async fn main() -> Result<()> {
 
     // PERMIT2_PERMIT input
     let permit_input = DynSolValue::Tuple(vec![
-        DynSolValue::Tuple(vec![
-            DynSolValue::Tuple(vec![
-                DynSolValue::Address(permit_single.details.token),
-                DynSolValue::Uint(U256::from(permit_single.details.amount), 160), // Correct U160 to U256 conversion
-                DynSolValue::Uint(U256::from(permit_single.details.expiration.to::<u64>()), 48),
-                DynSolValue::Uint(U256::from(permit_single.details.nonce.to::<u64>()), 48),
-            ]),
-            DynSolValue::Address(permit_single.spender),
-            DynSolValue::Uint(permit_single.sigDeadline, 256),
-        ]),
+    DynSolValue::Bytes(permit_single.abi_encode()),
         DynSolValue::Bytes(signature_bytes.to_vec()),
     ]).abi_encode();
 
     // V4_SWAP input: [SWAP_EXACT_IN_SINGLE (0x06), TAKE_ALL (0x0f), SETTLE_ALL (0x0c)]
-    let v4_actions_bytes: Bytes = vec![0x06, 0x0f, 0x0c].into();
+    let v4_actions_bytes: Bytes = vec![0x06, 0x0c, 0x0f].into();
 
     // SWAP_EXACT_IN_SINGLE params
     let pool_key_tuple = DynSolValue::Tuple(vec![
@@ -292,7 +308,8 @@ async fn main() -> Result<()> {
         DynSolValue::Int(alloy::primitives::I256::try_from(tick_spacing as i64).expect("tick_spacing fits in i64"), 24),
         DynSolValue::Address(hooks),
     ]);
-    let amount_out_min = amount_to_move * U256::from(99u8) / U256::from(100u8); // 1% slippage tolerance
+    // let amount_out_min = amount_to_move * U256::from(99u8) / U256::from(100u8); // 1% slippage tolerance
+    let amount_out_min = U256::from(0); // Set to 0 for no minimum
     let exact_in_tuple = DynSolValue::Tuple(vec![
         pool_key_tuple,
         DynSolValue::Bool(zero_for_one),
@@ -318,8 +335,8 @@ async fn main() -> Result<()> {
     // Combine V4 action arguments
     let v4_arguments = DynSolValue::Array(vec![
         DynSolValue::Bytes(exact_in_tuple.abi_encode()),
-        DynSolValue::Bytes(encoded_take),
         DynSolValue::Bytes(encoded_settle),
+        DynSolValue::Bytes(encoded_take),
     ]);
     let encoded_v4_swap_input = DynSolValue::Tuple(vec![
         DynSolValue::Bytes(v4_actions_bytes.to_vec()),
@@ -360,31 +377,31 @@ async fn main() -> Result<()> {
     }
 
     // Send transaction
-    println!("Sending transaction with Permit2 Permit and V4 Swap...");
-    match provider.send_transaction(tx).await {
-        Ok(pending_tx) => {
-            let tx_hash = pending_tx.tx_hash();
-            println!("Transaction sent! Hash: {}", tx_hash);
-            match pending_tx.watch().await {
-                Ok(receipt_hash) => {
-                    println!("Transaction confirmed with hash: {:?}", receipt_hash);
-                    match provider.get_transaction_receipt(receipt_hash).await {
-                        Ok(Some(receipt)) => {
-                            if receipt.status() {
-                                println!("✅ Transaction succeeded!");
-                            } else {
-                                println!("❌ Transaction failed");
-                            }
-                        }
-                        Ok(None) => println!("Receipt not found"),
-                        Err(e) => println!("Error getting receipt: {}", e),
-                    }
-                }
-                Err(e) => println!("Error waiting for transaction: {}", e),
-            }
-        }
-        Err(e) => println!("Error sending transaction: {}", e),
-    }
+    // println!("Sending transaction with Permit2 Permit and V4 Swap...");
+    // match provider.send_transaction(tx).await {
+    //     Ok(pending_tx) => {
+    //         let tx_hash = pending_tx.tx_hash();
+    //         println!("Transaction sent! Hash: {}", tx_hash);
+    //         match pending_tx.watch().await {
+    //             Ok(receipt_hash) => {
+    //                 println!("Transaction confirmed with hash: {:?}", receipt_hash);
+    //                 match provider.get_transaction_receipt(receipt_hash).await {
+    //                     Ok(Some(receipt)) => {
+    //                         if receipt.status() {
+    //                             println!("✅ Transaction succeeded!");
+    //                         } else {
+    //                             println!("❌ Transaction failed");
+    //                         }
+    //                     }
+    //                     Ok(None) => println!("Receipt not found"),
+    //                     Err(e) => println!("Error getting receipt: {}", e),
+    //                 }
+    //             }
+    //             Err(e) => println!("Error waiting for transaction: {}", e),
+    //         }
+    //     }
+    //     Err(e) => println!("Error sending transaction: {}", e),
+    // }
 
     Ok(())
 }
