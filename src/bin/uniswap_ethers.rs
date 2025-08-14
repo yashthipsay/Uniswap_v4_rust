@@ -4,9 +4,9 @@ use ethers::utils::keccak256;
 use std::sync::Arc;
 use eyre::Result;
 use std::time::{SystemTime, UNIX_EPOCH};
-use ethers::types::transaction::eip712::{Eip712, EIP712Domain, Eip712Error};
+use ethers::types::transaction::eip712::*;
 use ethers::types::transaction::eip2718::TypedTransaction; // for simulation
-
+use ethers::types::*;
 // Contract addresses
 const UNIVERSAL_ROUTER_V4: &str = "0x3A9D48AB9751398BbFa63ad67599Bb04e4BdF98b";
 const PERMIT2_CONTRACT: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
@@ -54,6 +54,148 @@ struct PermitDetails {
     amount: U256,      // will truncate to uint160 in EIP712 type string
     expiration: u64,   // uint48
     nonce: u64,        // uint48
+}
+
+/// Builds a Permit2 PermitSingle typed-data and signs it with `wallet`.
+/// Returns the 65-byte signature r||s||v (with v as 27/28), and the exact fields used.
+pub async fn sign_permit2_permit_single(
+    wallet: &LocalWallet,
+    chain_id: u64,
+    permit2: Address,
+    token: Address,
+    amount_u256: U256,         // will be masked to uint160
+    expiration_u64: u64,       // will be masked to uint48
+    nonce_u64: u64,            // will be masked to uint48
+    spender: Address,
+    sig_deadline_u256: U256,   // MUST equal what you pass in calldata
+) -> Result<(Vec<u8>, (Address, U256, U256, U256), Address, U256)> {
+
+    // Enforce width constraints exactly as Solidity expects.
+    let amount = amount_u256 & ((U256::one() << 160) - 1);
+    let expiration = U256::from(expiration_u64) & ((U256::one() << 48) - 1);
+    let nonce = U256::from(nonce_u64) & ((U256::one() << 48) - 1);
+    let sig_deadline = sig_deadline_u256; // no width restriction (uint256)
+
+    // EIP-712 types & domain (matching Permit2)
+    // NOTE: Permit2 uses name "Permit2". Including version "1" is correct for the canonical implementation.
+    let domain = serde_json::json!({
+        "name": "Permit2",
+        // "version": "1",
+        "chainId": chain_id,
+        "verifyingContract": format!("{:#x}", permit2),
+    });
+
+    let types = serde_json::json!({
+        "PermitSingle": [
+            {"name":"details","type":"PermitDetails"},
+            {"name":"spender","type":"address"},
+            {"name":"sigDeadline","type":"uint256"}
+        ],
+        "PermitDetails": [
+            {"name":"token","type":"address"},
+            {"name":"amount","type":"uint160"},
+            {"name":"expiration","type":"uint48"},
+            {"name":"nonce","type":"uint48"}
+        ]
+    });
+
+    let message = serde_json::json!({
+        "details": {
+            "token": format!("{:#x}", token),
+            "amount": amount.to_string(),         // fits into 160 bits
+            "expiration": expiration.as_u64(),  // fits into 48 bits
+            "nonce": nonce.as_u64(),            // fits into 48 bits
+        },
+        "spender": format!("{:#x}", spender),
+        "sigDeadline": sig_deadline,           // uint256
+    });
+
+    let typed = TypedData {
+        types: serde_json::from_value(types)?,
+        domain: serde_json::from_value(domain)?,
+        primary_type: "PermitSingle".to_string(),
+        message: serde_json::from_value(message)?,
+    };
+
+    let sig = wallet.sign_typed_data(&typed).await?;
+    let mut bytes = Vec::with_capacity(65);
+    // Convert r and s into 32-byte big-endian arrays
+    let mut r_bytes = [0u8; 32];
+    sig.r.to_big_endian(&mut r_bytes);
+    bytes.extend_from_slice(&r_bytes);
+    let mut s_bytes = [0u8; 32];
+    sig.s.to_big_endian(&mut s_bytes);
+    bytes.extend_from_slice(&s_bytes);
+    // ensure v is 27/28 as expected by Permit2
+    let v = if sig.v >= 27 { sig.v } else { sig.v + 27 };
+    bytes.push(v as u8);
+
+    Ok((bytes, (token, amount, expiration, nonce), spender, sig_deadline))
+}
+
+/// Input ABI: ((address,uint160,uint48,uint48),address,uint256) permit, bytes signature
+pub fn encode_permit2_permit_input(
+    details: (Address, U256, U256, U256), // (token, amount160, expiration48, nonce48)
+    spender: Address,
+    sig_deadline: U256,
+    signature_65: &[u8],
+) -> Bytes {
+    let permit_tuple = Token::Tuple(vec![
+        Token::Tuple(vec![
+            Token::Address(details.0),
+            Token::Uint(details.1), // amount (uint160 in Solidity, but encoded in 32 bytes)
+            Token::Uint(details.2), // expiration (uint48)
+            Token::Uint(details.3), // nonce (uint48)
+        ]),
+        Token::Address(spender),
+        Token::Uint(sig_deadline),
+    ]);
+
+    let encoded = abi::encode(&[permit_tuple, Token::Bytes(signature_65.to_vec())]);
+    Bytes::from(encoded)
+}
+
+pub fn build_permit2_digest_dynamic(
+    token: Address,
+    amount: U256,
+    expiration: u64,
+    nonce: u64,
+    spender: Address,
+    sig_deadline: U256,
+    chain_id: u64,
+    verifying_contract: Address,
+) -> [u8; 32] {
+    let details = PermitDetails {
+        token,
+        amount,
+        expiration,
+        nonce,
+    };
+
+    let permit = PermitSingle {
+        details,
+        spender,
+        sig_deadline,
+    };
+
+    // Build dynamic domain
+    let domain = EIP712Domain {
+        name: Some("Permit2".to_string()),
+        version: None,
+        chain_id: Some(U256::from(11155111u64)),
+        verifying_contract: Some(verifying_contract),
+        salt: None,
+    };
+
+    // Manually compute the EIP-712 digest using the provided domain
+    let domain_separator = domain.separator();
+    let struct_hash = permit.struct_hash().expect("Failed to compute struct hash");
+    let mut digest_input = [0u8; 2 + 32 + 32];
+    digest_input[0] = 0x19;
+    digest_input[1] = 0x01;
+    digest_input[2..34].copy_from_slice(&domain_separator);
+    digest_input[34..66].copy_from_slice(&struct_hash);
+    keccak256(&digest_input)
 }
 
 #[derive(Clone, Debug, ethers::contract::EthAbiType, ethers::contract::EthAbiCodec)]
@@ -199,6 +341,28 @@ async fn simulate_with_revert_decoding<M: Middleware>(
     }
 }
 
+fn print_revert_hex_from_error(err: &eyre::Report) {
+    let s = format!("{}", err);
+    if let Some(start) = s.find("0x") {
+        let hex_str = s[start..].split_whitespace().next().unwrap_or("");
+        if let Ok(bytes) = hex::decode(hex_str.trim_start_matches("0x")) {
+            if bytes.len() >= 4 {
+                println!("Decoded revert selector: 0x{}", hex::encode(&bytes[0..4]));
+            }
+            if bytes.len() >= 36 {
+                let arg = U256::from_big_endian(&bytes[4..36]);
+                println!("Decoded first uint256 arg: {}", arg);
+            } else {
+                println!("Revert payload length: {}", bytes.len());
+            }
+        } else {
+            println!("Failed to hex-decode revert string: {}", hex_str);
+        }
+    } else {
+        println!("No hex data found in error string: {}", s);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
@@ -303,10 +467,106 @@ async fn main() -> Result<()> {
         ]),
     ]);
 
-    // Build Universal Router calldata - ONLY using V4_SWAP command (0x10)
-    // Removing PERMIT2_PERMIT (0x0a) since we're skipping that part
-    let commands = Bytes::from(vec![0x10]); // Only V4_SWAP
-    let inputs = vec![Bytes::from(v4_swap_input_bytes)];
+   // --- Build and sign Permit2 PermitSingle, then encode PERMIT2_PERMIT input ---
+    // Use a max permit amount (2^160 - 1) like the Python reference
+    let max_permit_amount = {
+        let one: U256 = U256::from(1u64);
+        // (1 << 160) - 1
+        (one << 160) - one
+    };
+
+    // expiration and nonce for the PermitSingle (example values)
+    // let permit_expiration: u64 = current_timestamp + 30 * 24 * 3600; // 30 days
+    // let permit_nonce: u64 = 0u64;
+    // // use a far-future signature deadline to avoid SignatureExpired
+    // let sig_deadline = U256::MAX;
+
+let permit2 = Permit2::new(PERMIT2_CONTRACT.parse::<H160>()?, client.clone());
+let owner = client.signer().address();
+let ( _amt, _exp, onchain_nonce ) = permit2
+    .allowance(owner, USDC.parse()?, UNIVERSAL_ROUTER_V4.parse()?)
+    .call()
+    .await?;
+
+
+let permit_amount = max_permit_amount;                // use the SAME value for signing + calldata
+let permit_expiration: u64 = current_timestamp + 30 * 24 * 3600;
+let permit_nonce: u64 = onchain_nonce;       // MUST match on-chain
+let sig_deadline = U256::from(9999999999u64);   
+
+    // Build the EIP-712 digest using the helper
+    // let permit_hash = build_permit2_digest(
+    //     USDC.parse::<H160>()?,         // token
+    //     max_permit_amount,            // amount (U256)
+    //     permit_expiration,            // expiration (u64)
+    //     permit_nonce,                 // nonce (u64)
+    //     UNIVERSAL_ROUTER_V4.parse::<H160>()?, // spender
+    //     sig_deadline,                 // sig_deadline (U256)
+    //     11155111u64,                  // chain_id
+    //     PERMIT2_CONTRACT.parse::<H160>()?, // verifying_contract
+    // );
+
+    let permit_hash = build_permit2_digest_dynamic(
+        USDC.parse()?,                     // token
+        permit_amount,                     // amount (<= 2^160-1)
+        permit_expiration,                 // expiration (uint48)
+        permit_nonce,                      // nonce (uint48)
+        UNIVERSAL_ROUTER_V4.parse()?,      // spender
+        sig_deadline,                      // sigDeadline
+        11155111u64,                       // chain_id = Sepolia
+        PERMIT2_CONTRACT.parse()?,         // verifying_contract
+    );
+
+
+    // Sign the EIP-712 digest with the current signer (SignerMiddleware inside `client`)
+    // H256 conversion
+    let permit_hash_h256 = H256::from(permit_hash);
+    let signature: Signature = client.signer().sign_hash(permit_hash_h256).map_err(|e| eyre::eyre!("Signing error: {}", e))?;
+    let mut sig_bytes = signature.to_vec();
+    // Normalize v to 27/28 if needed (match reference code)
+    if sig_bytes.len() == 65 {
+        let v = sig_bytes[64];
+        if v < 27 { sig_bytes[64] = v + 27; }
+    }
+    let signature_bytes = sig_bytes;
+
+    // Encode PERMIT2_PERMIT input: (PermitSingle struct, bytes signature)
+    let permit_input_bytes = ethers::abi::encode(&[
+        Token::Tuple(vec![
+            Token::Tuple(vec![
+                Token::Address(USDC.parse()?),
+                Token::Uint(permit_amount),
+                Token::Uint(U256::from(permit_expiration)),
+                Token::Uint(U256::from(permit_nonce)),
+            ]),
+            Token::Address(UNIVERSAL_ROUTER_V4.parse()?),
+            Token::Uint(sig_deadline),
+        ]),
+        Token::Bytes(signature_bytes.clone()),
+    ]);
+let max_u160 = ((U256::one() << 160) - 1);
+let permit_amount = max_u160;
+let permit_expiration = current_timestamp + 30 * 24 * 3600; // fits in uint48
+let permit_sig_deadline = U256::from(permit_expiration);
+    let local: LocalWallet = client.signer().clone().with_chain_id(11155111u64);
+    let (sig65, details, spender, sig_deadline) = sign_permit2_permit_single(
+        &local,
+        11155111,
+        PERMIT2_CONTRACT.parse()?,
+        USDC.parse()?,
+        permit_amount,
+        permit_expiration,
+        onchain_nonce as u64,
+        UNIVERSAL_ROUTER_V4.parse()?,
+        sig_deadline,
+    ).await?;
+
+    // 3) Encode UR input for command 0x0a
+    let permit_input = encode_permit2_permit_input(details, spender, sig_deadline, &sig65);
+
+    // Build commands and inputs: PERMIT2_PERMIT (0x0a) first, then V4_SWAP (0x10)
+    let commands = Bytes::from(vec![0x0a, 0x10]);
+    let inputs   = vec![permit_input, Bytes::from(v4_swap_input_bytes)];
     let universal_router = UniversalRouter::new(UNIVERSAL_ROUTER_V4.parse::<H160>()?, client.clone());
     let calldata = universal_router
         .execute(commands, inputs, deadline)
@@ -314,24 +574,24 @@ async fn main() -> Result<()> {
         .ok_or_else(|| eyre::eyre!("Failed to encode calldata"))?;
     println!("Generated calldata: 0x{}", hex::encode(&calldata));
 
-    // Estimate gas & build transaction
-    let gas = client
-        .estimate_gas(&TransactionRequest::new().to(UNIVERSAL_ROUTER_V4.parse::<H160>()?).data(calldata.clone()).into(), None)
-        .await?;
+
 
     // Create transaction request
     let tx = TransactionRequest::new()
         .to(UNIVERSAL_ROUTER_V4.parse::<H160>()?)
         .from(client.signer().address())
         .data(calldata)
-        .gas(gas)
+        .gas(U256::from(1_000_000u64)) // Adjust gas limit as needed
         .gas_price(U256::from(30_000_000_000u64)); // 30 gwei
 
     // Simulate
     println!("Simulating transaction...");
     match simulate_with_revert_decoding(client.clone(), tx.clone()).await {
         Ok(data) => println!("Simulation successful: 0x{}", hex::encode(data)),
-        Err(e) => println!("Simulation failed: {}", e),
+        Err(e) => {
+            println!("Simulation failed: {}", e);
+            print_revert_hex_from_error(&e);
+        }
     }
 
     // Send
