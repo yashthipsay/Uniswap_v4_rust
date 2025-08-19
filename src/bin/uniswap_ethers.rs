@@ -363,6 +363,14 @@ fn print_revert_hex_from_error(err: &eyre::Report) {
     }
 }
 
+fn _get_all_token_addresses(){
+
+}
+
+fn _map_routes_for_liquidity_pools(){
+
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
