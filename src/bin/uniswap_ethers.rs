@@ -514,48 +514,50 @@ let sig_deadline = U256::from(9999999999u64);
     //     PERMIT2_CONTRACT.parse::<H160>()?, // verifying_contract
     // );
 
-    let permit_hash = build_permit2_digest_dynamic(
-        USDC.parse()?,                     // token
-        permit_amount,                     // amount (<= 2^160-1)
-        permit_expiration,                 // expiration (uint48)
-        permit_nonce,                      // nonce (uint48)
-        UNIVERSAL_ROUTER_V4.parse()?,      // spender
-        sig_deadline,                      // sigDeadline
-        11155111u64,                       // chain_id = Sepolia
-        PERMIT2_CONTRACT.parse()?,         // verifying_contract
-    );
+    // let permit_hash = build_permit2_digest_dynamic(
+    //     USDC.parse()?,                     // token
+    //     permit_amount,                     // amount (<= 2^160-1)
+    //     permit_expiration,                 // expiration (uint48)
+    //     permit_nonce,                      // nonce (uint48)
+    //     UNIVERSAL_ROUTER_V4.parse()?,      // spender
+    //     sig_deadline,                      // sigDeadline
+    //     11155111u64,                       // chain_id = Sepolia
+    //     PERMIT2_CONTRACT.parse()?,         // verifying_contract
+    // );
 
 
-    // Sign the EIP-712 digest with the current signer (SignerMiddleware inside `client`)
-    // H256 conversion
-    let permit_hash_h256 = H256::from(permit_hash);
-    let signature: Signature = client.signer().sign_hash(permit_hash_h256).map_err(|e| eyre::eyre!("Signing error: {}", e))?;
-    let mut sig_bytes = signature.to_vec();
-    // Normalize v to 27/28 if needed (match reference code)
-    if sig_bytes.len() == 65 {
-        let v = sig_bytes[64];
-        if v < 27 { sig_bytes[64] = v + 27; }
-    }
-    let signature_bytes = sig_bytes;
+    // // Sign the EIP-712 digest with the current signer (SignerMiddleware inside `client`)
+    // // H256 conversion
+    // let permit_hash_h256 = H256::from(permit_hash);
+    // let signature: Signature = client.signer().sign_hash(permit_hash_h256).map_err(|e| eyre::eyre!("Signing error: {}", e))?;
+    // let mut sig_bytes = signature.to_vec();
+    // // Normalize v to 27/28 if needed (match reference code)
+    // if sig_bytes.len() == 65 {
+    //     let v = sig_bytes[64];
+    //     if v < 27 { sig_bytes[64] = v + 27; }
+    // }
+    // let signature_bytes = sig_bytes;
 
-    // Encode PERMIT2_PERMIT input: (PermitSingle struct, bytes signature)
-    let permit_input_bytes = ethers::abi::encode(&[
-        Token::Tuple(vec![
-            Token::Tuple(vec![
-                Token::Address(USDC.parse()?),
-                Token::Uint(permit_amount),
-                Token::Uint(U256::from(permit_expiration)),
-                Token::Uint(U256::from(permit_nonce)),
-            ]),
-            Token::Address(UNIVERSAL_ROUTER_V4.parse()?),
-            Token::Uint(sig_deadline),
-        ]),
-        Token::Bytes(signature_bytes.clone()),
-    ]);
+    // // Encode PERMIT2_PERMIT input: (PermitSingle struct, bytes signature)
+    // let permit_input_bytes = ethers::abi::encode(&[
+    //     Token::Tuple(vec![
+    //         Token::Tuple(vec![
+    //             Token::Address(USDC.parse()?),
+    //             Token::Uint(permit_amount),
+    //             Token::Uint(U256::from(permit_expiration)),
+    //             Token::Uint(U256::from(permit_nonce)),
+    //         ]),
+    //         Token::Address(UNIVERSAL_ROUTER_V4.parse()?),
+    //         Token::Uint(sig_deadline),
+    //     ]),
+    //     Token::Bytes(signature_bytes.clone()),
+    // ]);
 let max_u160 = ((U256::one() << 160) - 1);
 let permit_amount = max_u160;
 let permit_expiration = current_timestamp + 30 * 24 * 3600; // fits in uint48
 let permit_sig_deadline = U256::from(permit_expiration);
+
+
     let local: LocalWallet = client.signer().clone().with_chain_id(11155111u64);
     let (sig65, details, spender, sig_deadline) = sign_permit2_permit_single(
         &local,
