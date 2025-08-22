@@ -273,6 +273,7 @@ async fn main() -> Result<()> {
     let amount_out_min = Token::Bytes(path.to_vec());
     let path_t = Token::Bytes(path.to_vec());
     let payer_is_user = Token::Bool(true);
+    let sqrtpricelimitx96 = 0;
 
     let v3_swap_exact_in_input = {
         let encoded = abi::encode(&[
@@ -281,6 +282,7 @@ async fn main() -> Result<()> {
             amount_out_min,
             path_t,
             payer_is_user,
+            Token::Uint(U256::from(sqrtpricelimitx96)),
         ]);
         Bytes::from(encoded)
     };
@@ -319,11 +321,11 @@ async fn main() -> Result<()> {
     }
 
     // Send transaction
-    let pending = client.send_transaction(tx, None).await?;
-    let receipt = pending.await?;
-    println!("Transaction receipt: {:?}", receipt);
+    // let pending = client.send_transaction(tx, None).await?;
+    // let receipt = pending.await?;
+    // println!("Transaction receipt: {:?}", receipt);
 
-    println!("Swap tx: {:?}", receipt);
+    // println!("Swap tx: {:?}", receipt);
 
     Ok(())
 }
